@@ -12,6 +12,7 @@
   "bank",
   "column_break_4",
   "import_mt940_fromat",
+  "import_camt053_format",
   "custom_delimiters",
   "delimiter_options",
   "google_sheets_url",
@@ -221,7 +222,13 @@
    "default": "0",
    "fieldname": "import_mt940_fromat",
    "fieldtype": "Check",
-   "label": "Import MT940 Fromat"
+   "label": "Import MT940 Format"
+  },
+  {
+   "default": "0",
+   "fieldname": "import_camt053_format",
+   "fieldtype": "Check",
+   "label": "Import camt.053 Format"
   }
  ],
  "hide_toolbar": 1,

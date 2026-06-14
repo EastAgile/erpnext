@@ -6,6 +6,7 @@ import csv
 import io
 import json
 import re
+import xml.etree.ElementTree as ET
 from datetime import date, datetime
 
 import frappe
@@ -38,6 +39,7 @@ class BankStatementImport(DataImport):
 		custom_delimiters: DF.Check
 		delimiter_options: DF.Data | None
 		google_sheets_url: DF.Data | None
+		import_camt053_format: DF.Check
 		import_file: DF.Attach | None
 		import_mt940_fromat: DF.Check
 		import_type: DF.Literal["", "Insert New Records", "Update Existing Records"]
@@ -71,7 +73,7 @@ class BankStatementImport(DataImport):
 
 			self.template_warnings = ""
 
-		if self.import_file and not self.import_file.lower().endswith(".txt"):
+		if self.import_file and not self.import_file.lower().endswith((".txt", ".xml")):
 			self.validate_import_file()
 			self.validate_google_sheets_url()
 
@@ -237,6 +239,184 @@ def is_mt940_format(content: str) -> bool:
 	"""Check if the content has key MT940 tags"""
 	required_tags = [":20:", ":25:", ":28C:", ":61:"]
 	return all(tag in content for tag in required_tags)
+
+
+def is_camt053_format(content: str) -> bool:
+	"""Detect an ISO 20022 camt.053 (Bank-to-Customer Statement) document.
+
+	Version-agnostic: matches camt.053.001.02 / .04 / .08 / .10 by the namespace
+	hint or the root statement element, so it does not break when the bank bumps
+	the message version.
+	"""
+	return "camt.053" in content or "BkToCstmrStmt" in content
+
+
+def _ln(tag: str) -> str:
+	"""Local name of an XML tag, stripping any ``{namespace}`` prefix."""
+	return tag.rsplit("}", 1)[-1]
+
+
+def _find(el, name: str):
+	"""First direct child of ``el`` whose local name is ``name`` (or None)."""
+	if el is None:
+		return None
+	for child in el:
+		if _ln(child.tag) == name:
+			return child
+	return None
+
+
+def _findall(el, name: str):
+	"""All direct children of ``el`` whose local name is ``name``."""
+	if el is None:
+		return []
+	return [child for child in el if _ln(child.tag) == name]
+
+
+def _text(el, name: str) -> str:
+	"""Text of the first ``name`` child of ``el`` (trimmed), or empty string."""
+	child = _find(el, name)
+	return (child.text or "").strip() if child is not None and child.text else ""
+
+
+def _date(parent, name: str) -> str:
+	"""Date (YYYY-MM-DD) from a ``<BookgDt>``/``<ValDt>`` block, which wraps
+	either a ``<Dt>`` (date) or ``<DtTm>`` (datetime)."""
+	el = _find(parent, name)
+	if el is None:
+		return ""
+	value = _text(el, "Dt") or _text(el, "DtTm")
+	return value[:10] if value else ""
+
+
+def parse_camt053(content: str) -> list[dict]:
+	"""Parse a camt.053 XML statement into normalised transaction dicts.
+
+	Returns one row per *booked* entry (pending entries are skipped) with the
+	same shape the MT940 path produces, ready to be written to the import CSV.
+	Namespace/version agnostic — elements are matched by local name.
+	"""
+	try:
+		root = ET.fromstring(content)
+	except ET.ParseError as e:
+		frappe.throw(_("Failed to parse camt.053 XML. Error: {0}").format(str(e)))
+
+	# Document > BkToCstmrStmt > Stmt+  (root may be Document or BkToCstmrStmt)
+	bk = root if _ln(root.tag) == "BkToCstmrStmt" else _find(root, "BkToCstmrStmt")
+	transactions = []
+
+	for stmt in _findall(bk, "Stmt"):
+		for ntry in _findall(stmt, "Ntry"):
+			# Only import booked entries; skip pending (PDNG) ones.
+			sts = _find(ntry, "Sts")
+			status = ""
+			if sts is not None:
+				status = (sts.text or "").strip() or _text(sts, "Cd")
+			if status and status.upper() not in ("BOOK", "BOOKED"):
+				continue
+
+			amt_el = _find(ntry, "Amt")
+			try:
+				amount = float((amt_el.text or "0").strip()) if amt_el is not None else 0.0
+			except ValueError:
+				amount = 0.0
+			currency = amt_el.get("Ccy", "") if amt_el is not None else ""
+			cdtdbt = _text(ntry, "CdtDbtInd").upper()
+
+			date_str = _date(ntry, "BookgDt") or _date(ntry, "ValDt")
+			reference = _text(ntry, "AcctSvcrRef") or _text(ntry, "NtryRef")
+
+			description_parts = []
+			addtl = _text(ntry, "AddtlNtryInf")
+			if addtl:
+				description_parts.append(addtl)
+
+			ntry_dtls = _find(ntry, "NtryDtls")
+			if ntry_dtls is not None:
+				for txdtls in _findall(ntry_dtls, "TxDtls"):
+					if not reference:
+						refs = _find(txdtls, "Refs")
+						reference = (
+							_text(refs, "EndToEndId")
+							or _text(refs, "InstrId")
+							or _text(refs, "TxId")
+						)
+					rmt = _find(txdtls, "RmtInf")
+					for ustrd in _findall(rmt, "Ustrd"):
+						if ustrd.text and ustrd.text.strip():
+							description_parts.append(ustrd.text.strip())
+					# Counterparty: the payer (Dbtr) on money in, the payee (Cdtr) on money out.
+					rltd = _find(txdtls, "RltdPties")
+					party = _find(rltd, "Cdtr") if cdtdbt == "DBIT" else _find(rltd, "Dbtr")
+					name = _text(party, "Nm")
+					if name:
+						description_parts.append(name)
+
+			if reference.upper() == "NOTPROVIDED":
+				reference = ""
+
+			# De-duplicate while preserving order, then join.
+			description = " | ".join(dict.fromkeys(p for p in description_parts if p))
+
+			transactions.append(
+				{
+					"date": date_str,
+					"deposit": amount if cdtdbt == "CRDT" else "",
+					"withdrawal": amount if cdtdbt == "DBIT" else "",
+					"description": description,
+					"reference": reference,
+					"currency": currency,
+				}
+			)
+
+	return transactions
+
+
+@frappe.whitelist()
+def convert_camt053_to_csv(data_import, camt_file_path):
+	doc = frappe.get_doc("Bank Statement Import", data_import)
+
+	_file_doc, content = get_file(camt_file_path)
+	if isinstance(content, bytes):
+		content = content.decode("utf-8")
+
+	if not is_camt053_format(content):
+		frappe.throw(_("The uploaded file does not appear to be a valid camt.053 statement."))
+
+	if not doc.import_camt053_format:
+		frappe.throw(_("camt.053 file detected. Please enable 'Import camt.053 Format' to proceed."))
+
+	transactions = parse_camt053(content)
+	if not transactions:
+		frappe.throw(
+			_("Parsed file is not a valid camt.053 statement or contains no booked transactions.")
+		)
+
+	csv_buffer = io.StringIO()
+	writer = csv.writer(csv_buffer)
+	headers = ["Date", "Deposit", "Withdrawal", "Description", "Reference Number", "Bank Account", "Currency"]
+	writer.writerow(headers)
+
+	for txn in transactions:
+		writer.writerow(
+			[
+				txn["date"],
+				txn["deposit"],
+				txn["withdrawal"],
+				txn["description"],
+				txn["reference"],
+				doc.bank_account,
+				txn["currency"],
+			]
+		)
+
+	csv_content = csv_buffer.getvalue().encode("utf-8")
+	csv_buffer.close()
+
+	filename = f"{frappe.utils.now_datetime().strftime('%Y%m%d%H%M%S')}_converted_camt053.csv"
+	saved_file = save_file(filename, csv_content, doc.doctype, doc.name, is_private=True, df="import_file")
+
+	return saved_file.file_url
 
 
 def parse_data_from_template(raw_data):
