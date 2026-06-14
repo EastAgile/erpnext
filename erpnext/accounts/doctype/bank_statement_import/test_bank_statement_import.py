@@ -285,3 +285,42 @@ class TestBankStatementImport(ERPNextTestSuite):
 		"""Pending (PDNG) entries must never be imported as booked transactions."""
 		rows = parse_camt053(CAMT053_SAMPLE)
 		self.assertTrue(all(r["date"] != "2026-06-14" for r in rows))
+
+	def test_parse_camt053_bktxcd_reference_fallback(self):
+		"""A card entry with no AcctSvcrRef/EndToEndId falls back to the
+		proprietary BkTxCd/Prtry/Cd id; BookgDt given as DtTm is trimmed to a date."""
+		xml = (
+			'<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10">'
+			"<BkToCstmrStmt><Stmt><Ntry>"
+			'<Amt Ccy="GBP">1.29</Amt><CdtDbtInd>DBIT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>'
+			"<BookgDt><DtTm>2026-06-08T00:59:54.238316+07:00</DtTm></BookgDt>"
+			"<BkTxCd><Prtry><Cd>CARD-3893862515</Cd></Prtry></BkTxCd>"
+			"<AddtlNtryInf>Card transaction issued by Anthropic</AddtlNtryInf>"
+			"</Ntry></Stmt></BkToCstmrStmt></Document>"
+		)
+		rows = parse_camt053(xml)
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(rows[0]["reference"], "CARD-3893862515")
+		self.assertEqual(rows[0]["date"], "2026-06-08")
+		self.assertEqual(rows[0]["withdrawal"], 1.29)
+
+	def test_parse_camt053_reversal_does_not_flip_sign(self):
+		"""Per ISO 20022, CdtDbtInd states the actual direction of the booking and
+		RvslInd is informational ("If CdtDbtInd is CRDT and ReversalIndicator is
+		Yes, the original operation was a debit entry"). A reversal of a debit is
+		itself a credit, so a CRDT+RvslInd entry must stay a deposit, not a
+		withdrawal, and the reversal is noted in the description only."""
+		xml = (
+			'<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10">'
+			"<BkToCstmrStmt><Stmt><Ntry>"
+			'<Amt Ccy="GBP">100.00</Amt><CdtDbtInd>CRDT</CdtDbtInd>'
+			"<RvslInd>true</RvslInd><Sts><Cd>BOOK</Cd></Sts>"
+			"<BookgDt><Dt>2026-03-01</Dt></BookgDt><AcctSvcrRef>REV-1</AcctSvcrRef>"
+			"<AddtlNtryInf>Refund of earlier card charge</AddtlNtryInf>"
+			"</Ntry></Stmt></BkToCstmrStmt></Document>"
+		)
+		rows = parse_camt053(xml)
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(rows[0]["deposit"], 100.00)  # increase — NOT flipped
+		self.assertEqual(rows[0]["withdrawal"], "")
+		self.assertIn("Reversal", rows[0]["description"])
