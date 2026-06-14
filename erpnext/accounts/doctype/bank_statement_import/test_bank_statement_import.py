@@ -2,10 +2,47 @@
 # See license.txt
 
 from erpnext.accounts.doctype.bank_statement_import.bank_statement_import import (
+	is_camt053_format,
 	is_mt940_format,
+	parse_camt053,
 	preprocess_mt940_content,
 )
 from erpnext.tests.utils import ERPNextTestSuite
+
+CAMT053_SAMPLE = """<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10">
+  <BkToCstmrStmt>
+    <GrpHdr><MsgId>STMT-001</MsgId><CreDtTm>2026-06-14T00:00:00</CreDtTm></GrpHdr>
+    <Stmt>
+      <Id>STMT-GBP</Id>
+      <Acct><Id><IBAN>GB00WISE00000000000000</IBAN></Id><Ccy>GBP</Ccy></Acct>
+      <Ntry>
+        <Amt Ccy="GBP">2500.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>
+        <BookgDt><Dt>2026-02-10</Dt></BookgDt><ValDt><Dt>2026-02-10</Dt></ValDt>
+        <AcctSvcrRef>TRANSFER-1001</AcctSvcrRef>
+        <NtryDtls><TxDtls>
+          <Refs><EndToEndId>FOUNDER</EndToEndId></Refs>
+          <RmtInf><Ustrd>Director loan</Ustrd></RmtInf>
+          <RltdPties><Dbtr><Nm>Lawrence Sinclair</Nm></Dbtr></RltdPties>
+        </TxDtls></NtryDtls>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="GBP">42.00</Amt><CdtDbtInd>DBIT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>
+        <BookgDt><Dt>2026-02-23</Dt></BookgDt><AcctSvcrRef>CARD-2002</AcctSvcrRef>
+        <NtryDtls><TxDtls>
+          <Refs><EndToEndId>NOTPROVIDED</EndToEndId></Refs>
+          <RmtInf><Ustrd>Hetzner hosting</Ustrd></RmtInf>
+          <RltdPties><Cdtr><Nm>Hetzner Online GmbH</Nm></Cdtr></RltdPties>
+        </TxDtls></NtryDtls>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="GBP">99.99</Amt><CdtDbtInd>DBIT</CdtDbtInd><Sts><Cd>PDNG</Cd></Sts>
+        <BookgDt><Dt>2026-06-14</Dt></BookgDt>
+        <NtryDtls><TxDtls><RmtInf><Ustrd>Pending</Ustrd></RmtInf></TxDtls></NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>"""
 
 
 class TestBankStatementImport(ERPNextTestSuite):
@@ -206,3 +243,45 @@ class TestBankStatementImport(ERPNextTestSuite):
 		mt940_content = "   :28C:167619/1\n"
 		result = preprocess_mt940_content(mt940_content)
 		self.assertEqual(result, mt940_content)  # Should remain unchanged
+
+	def test_is_camt053_format_detection(self):
+		"""camt.053 detection by namespace hint or root statement element."""
+		self.assertTrue(is_camt053_format(CAMT053_SAMPLE))
+		self.assertTrue(is_camt053_format("<x xmlns='...camt.053.001.02'></x>"))
+		self.assertFalse(is_camt053_format("Date,Description,Amount\n2026-01-01,Test,100"))
+		self.assertFalse(is_camt053_format(""))
+
+	def test_parse_camt053_basic(self):
+		"""camt.053 parsing: amounts, Cr/Dr direction, dates, currency."""
+		rows = parse_camt053(CAMT053_SAMPLE)
+
+		# Only the two BOOKED entries; the PDNG entry is skipped.
+		self.assertEqual(len(rows), 2)
+
+		credit, debit = rows[0], rows[1]
+		# Money in -> deposit column; money out -> withdrawal column.
+		self.assertEqual(credit["deposit"], 2500.00)
+		self.assertEqual(credit["withdrawal"], "")
+		self.assertEqual(debit["withdrawal"], 42.00)
+		self.assertEqual(debit["deposit"], "")
+		# Booking date and currency.
+		self.assertEqual(credit["date"], "2026-02-10")
+		self.assertEqual(credit["currency"], "GBP")
+
+	def test_parse_camt053_references_and_counterparty(self):
+		"""Reference falls back past NOTPROVIDED; counterparty matches direction."""
+		credit, debit = parse_camt053(CAMT053_SAMPLE)
+
+		# Incoming: counterparty is the payer (Dbtr).
+		self.assertIn("Lawrence Sinclair", credit["description"])
+		self.assertEqual(credit["reference"], "TRANSFER-1001")
+
+		# Outgoing: counterparty is the payee (Cdtr); EndToEndId "NOTPROVIDED"
+		# is ignored, so the reference falls back to AcctSvcrRef.
+		self.assertIn("Hetzner Online GmbH", debit["description"])
+		self.assertEqual(debit["reference"], "CARD-2002")
+
+	def test_parse_camt053_skips_pending_entries(self):
+		"""Pending (PDNG) entries must never be imported as booked transactions."""
+		rows = parse_camt053(CAMT053_SAMPLE)
+		self.assertTrue(all(r["date"] != "2026-06-14" for r in rows))
