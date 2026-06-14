@@ -70,7 +70,7 @@ frappe.ui.form.on("Bank Statement Import", {
 
 		frm.get_field("import_file").df.options = {
 			restrictions: {
-				allowed_file_types: [".csv", ".xls", ".xlsx", ".TXT", ".txt"],
+				allowed_file_types: [".csv", ".xls", ".xlsx", ".TXT", ".txt", ".xml", ".XML"],
 			},
 		};
 
@@ -198,17 +198,18 @@ frappe.ui.form.on("Bank Statement Import", {
 		frm.save();
 	},
 
+	import_camt053_format(frm) {
+		frm.trigger("toggle_mt940_note");
+		frm.save();
+	},
+
 	toggle_mt940_note(frm) {
-		if (!frm.doc.import_mt940_fromat) {
-			frm.set_df_property("custom_delimiters", "hidden", 0);
-			frm.set_df_property("google_sheets_url", "hidden", 0);
-			frm.set_df_property("html_5", "hidden", 0);
-		} else {
-			frm.set_df_property("custom_delimiters", "hidden", 1);
-			frm.set_df_property("google_sheets_url", "hidden", 1);
-			frm.set_df_property("html_5", "hidden", 1);
-		}
-		frm.set_value("import_mt940_fromat", frm.doc.import_mt940_fromat);
+		// CSV-specific options are irrelevant when importing a structured bank
+		// format (MT940 or camt.053), so hide them in that case.
+		const structured = frm.doc.import_mt940_fromat || frm.doc.import_camt053_format;
+		frm.set_df_property("custom_delimiters", "hidden", structured ? 1 : 0);
+		frm.set_df_property("google_sheets_url", "hidden", structured ? 1 : 0);
+		frm.set_df_property("html_5", "hidden", structured ? 1 : 0);
 	},
 
 	show_report_error_button(frm) {
@@ -319,6 +320,24 @@ frappe.ui.form.on("Bank Statement Import", {
 							args: {
 								data_import: frm.doc.name,
 								mt940_file_path: frm.doc.import_file,
+							},
+						})
+						.then((r) => {
+							const file_url = r.message;
+							frm.set_value("import_file", file_url);
+							frm.save();
+						});
+				}
+			},
+			// Convert camt.053 to CSV if .xml file
+			() => {
+				if (frm.doc.import_file && frm.doc.import_file.toLowerCase().endsWith(".xml")) {
+					return frm
+						.call({
+							method: "convert_camt053_to_csv",
+							args: {
+								data_import: frm.doc.name,
+								camt_file_path: frm.doc.import_file,
 							},
 						})
 						.then((r) => {

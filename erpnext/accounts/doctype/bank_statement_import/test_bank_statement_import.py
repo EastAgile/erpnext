@@ -2,10 +2,47 @@
 # See license.txt
 
 from erpnext.accounts.doctype.bank_statement_import.bank_statement_import import (
+	is_camt053_format,
 	is_mt940_format,
+	parse_camt053,
 	preprocess_mt940_content,
 )
 from erpnext.tests.utils import ERPNextTestSuite
+
+CAMT053_SAMPLE = """<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10">
+  <BkToCstmrStmt>
+    <GrpHdr><MsgId>STMT-001</MsgId><CreDtTm>2026-06-14T00:00:00</CreDtTm></GrpHdr>
+    <Stmt>
+      <Id>STMT-GBP</Id>
+      <Acct><Id><IBAN>GB00WISE00000000000000</IBAN></Id><Ccy>GBP</Ccy></Acct>
+      <Ntry>
+        <Amt Ccy="GBP">2500.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>
+        <BookgDt><Dt>2026-02-10</Dt></BookgDt><ValDt><Dt>2026-02-10</Dt></ValDt>
+        <AcctSvcrRef>TRANSFER-1001</AcctSvcrRef>
+        <NtryDtls><TxDtls>
+          <Refs><EndToEndId>FOUNDER</EndToEndId></Refs>
+          <RmtInf><Ustrd>Director loan</Ustrd></RmtInf>
+          <RltdPties><Dbtr><Nm>Lawrence Sinclair</Nm></Dbtr></RltdPties>
+        </TxDtls></NtryDtls>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="GBP">42.00</Amt><CdtDbtInd>DBIT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>
+        <BookgDt><Dt>2026-02-23</Dt></BookgDt><AcctSvcrRef>CARD-2002</AcctSvcrRef>
+        <NtryDtls><TxDtls>
+          <Refs><EndToEndId>NOTPROVIDED</EndToEndId></Refs>
+          <RmtInf><Ustrd>Hetzner hosting</Ustrd></RmtInf>
+          <RltdPties><Cdtr><Nm>Hetzner Online GmbH</Nm></Cdtr></RltdPties>
+        </TxDtls></NtryDtls>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="GBP">99.99</Amt><CdtDbtInd>DBIT</CdtDbtInd><Sts><Cd>PDNG</Cd></Sts>
+        <BookgDt><Dt>2026-06-14</Dt></BookgDt>
+        <NtryDtls><TxDtls><RmtInf><Ustrd>Pending</Ustrd></RmtInf></TxDtls></NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>"""
 
 
 class TestBankStatementImport(ERPNextTestSuite):
@@ -206,3 +243,135 @@ class TestBankStatementImport(ERPNextTestSuite):
 		mt940_content = "   :28C:167619/1\n"
 		result = preprocess_mt940_content(mt940_content)
 		self.assertEqual(result, mt940_content)  # Should remain unchanged
+
+	def test_is_camt053_format_detection(self):
+		"""camt.053 detection by namespace hint or root statement element."""
+		self.assertTrue(is_camt053_format(CAMT053_SAMPLE))
+		self.assertTrue(is_camt053_format("<x xmlns='...camt.053.001.02'></x>"))
+		self.assertFalse(is_camt053_format("Date,Description,Amount\n2026-01-01,Test,100"))
+		self.assertFalse(is_camt053_format(""))
+
+	def test_parse_camt053_basic(self):
+		"""camt.053 parsing: amounts, Cr/Dr direction, dates, currency."""
+		rows = parse_camt053(CAMT053_SAMPLE)
+
+		# Only the two BOOKED entries; the PDNG entry is skipped.
+		self.assertEqual(len(rows), 2)
+
+		credit, debit = rows[0], rows[1]
+		# Money in -> deposit column; money out -> withdrawal column.
+		self.assertEqual(credit["deposit"], 2500.00)
+		self.assertEqual(credit["withdrawal"], "")
+		self.assertEqual(debit["withdrawal"], 42.00)
+		self.assertEqual(debit["deposit"], "")
+		# Booking date and currency.
+		self.assertEqual(credit["date"], "2026-02-10")
+		self.assertEqual(credit["currency"], "GBP")
+
+	def test_parse_camt053_references_and_counterparty(self):
+		"""Reference falls back past NOTPROVIDED; counterparty matches direction."""
+		credit, debit = parse_camt053(CAMT053_SAMPLE)
+
+		# Incoming: counterparty is the payer (Dbtr).
+		self.assertIn("Lawrence Sinclair", credit["description"])
+		self.assertEqual(credit["reference"], "TRANSFER-1001")
+
+		# Outgoing: counterparty is the payee (Cdtr); EndToEndId "NOTPROVIDED"
+		# is ignored, so the reference falls back to AcctSvcrRef.
+		self.assertIn("Hetzner Online GmbH", debit["description"])
+		self.assertEqual(debit["reference"], "CARD-2002")
+
+	def test_parse_camt053_skips_pending_entries(self):
+		"""Pending (PDNG) entries must never be imported as booked transactions."""
+		rows = parse_camt053(CAMT053_SAMPLE)
+		self.assertTrue(all(r["date"] != "2026-06-14" for r in rows))
+
+	def test_parse_camt053_bktxcd_reference_fallback(self):
+		"""A card entry with no AcctSvcrRef/EndToEndId falls back to the
+		proprietary BkTxCd/Prtry/Cd id; BookgDt given as DtTm is trimmed to a date."""
+		xml = (
+			'<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10">'
+			"<BkToCstmrStmt><Stmt><Ntry>"
+			'<Amt Ccy="GBP">1.29</Amt><CdtDbtInd>DBIT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>'
+			"<BookgDt><DtTm>2026-06-08T00:59:54.238316+07:00</DtTm></BookgDt>"
+			"<BkTxCd><Prtry><Cd>CARD-3893862515</Cd></Prtry></BkTxCd>"
+			"<AddtlNtryInf>Card transaction issued by Anthropic</AddtlNtryInf>"
+			"</Ntry></Stmt></BkToCstmrStmt></Document>"
+		)
+		rows = parse_camt053(xml)
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(rows[0]["reference"], "CARD-3893862515")
+		self.assertEqual(rows[0]["date"], "2026-06-08")
+		self.assertEqual(rows[0]["withdrawal"], 1.29)
+
+	def test_parse_camt053_reversal_does_not_flip_sign(self):
+		"""Per ISO 20022, CdtDbtInd states the actual direction of the booking and
+		RvslInd is informational ("If CdtDbtInd is CRDT and ReversalIndicator is
+		Yes, the original operation was a debit entry"). A reversal of a debit is
+		itself a credit, so a CRDT+RvslInd entry must stay a deposit, not a
+		withdrawal, and the reversal is noted in the description only."""
+		xml = (
+			'<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10">'
+			"<BkToCstmrStmt><Stmt><Ntry>"
+			'<Amt Ccy="GBP">100.00</Amt><CdtDbtInd>CRDT</CdtDbtInd>'
+			"<RvslInd>true</RvslInd><Sts><Cd>BOOK</Cd></Sts>"
+			"<BookgDt><Dt>2026-03-01</Dt></BookgDt><AcctSvcrRef>REV-1</AcctSvcrRef>"
+			"<AddtlNtryInf>Refund of earlier card charge</AddtlNtryInf>"
+			"</Ntry></Stmt></BkToCstmrStmt></Document>"
+		)
+		rows = parse_camt053(xml)
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(rows[0]["deposit"], 100.00)  # increase — NOT flipped
+		self.assertEqual(rows[0]["withdrawal"], "")
+		self.assertIn("Reversal", rows[0]["description"])
+
+	def test_parse_camt053_multiple_statements_and_currencies(self):
+		"""A document may carry several Stmt blocks (one per currency, as Wise
+		exports). Entries from every statement are returned, each with its own
+		currency taken from the Amt @Ccy attribute."""
+		xml = (
+			'<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10"><BkToCstmrStmt>'
+			"<Stmt><Acct><Ccy>GBP</Ccy></Acct><Ntry>"
+			'<Amt Ccy="GBP">10.00</Amt><CdtDbtInd>DBIT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>'
+			"<BookgDt><Dt>2026-03-01</Dt></BookgDt><AddtlNtryInf>GBP card</AddtlNtryInf></Ntry></Stmt>"
+			"<Stmt><Acct><Ccy>USD</Ccy></Acct><Ntry>"
+			'<Amt Ccy="USD">2003.40</Amt><CdtDbtInd>CRDT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>'
+			"<BookgDt><Dt>2026-04-08</Dt></BookgDt><AddtlNtryInf>Topped up account</AddtlNtryInf></Ntry></Stmt>"
+			"</BkToCstmrStmt></Document>"
+		)
+		rows = parse_camt053(xml)
+		self.assertEqual(len(rows), 2)
+		self.assertEqual(rows[0]["currency"], "GBP")
+		self.assertEqual(rows[0]["withdrawal"], 10.00)
+		self.assertEqual(rows[1]["currency"], "USD")
+		self.assertEqual(rows[1]["deposit"], 2003.40)
+
+	def test_parse_camt053_empty_statement(self):
+		"""A statement with no entries (e.g. an opened-but-unused currency) yields
+		no rows rather than erroring."""
+		xml = (
+			'<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10">'
+			"<BkToCstmrStmt><Stmt><Acct><Ccy>EUR</Ccy></Acct></Stmt></BkToCstmrStmt></Document>"
+		)
+		self.assertEqual(parse_camt053(xml), [])
+
+	def test_parse_camt053_description_assembly(self):
+		"""Description joins AddtlNtryInf + each RmtInf/Ustrd + counterparty,
+		de-duplicated and pipe-separated."""
+		xml = (
+			'<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10">'
+			"<BkToCstmrStmt><Stmt><Ntry>"
+			'<Amt Ccy="USD">90.43</Amt><CdtDbtInd>DBIT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>'
+			"<BookgDt><Dt>2026-03-03</Dt></BookgDt><AcctSvcrRef>INV 3477</AcctSvcrRef>"
+			"<AddtlNtryInf>Sent money to EAST AGILE LIMITED</AddtlNtryInf>"
+			"<NtryDtls><TxDtls>"
+			"<RmtInf><Ustrd>INV 3477</Ustrd><Ustrd>Development services</Ustrd></RmtInf>"
+			"<RltdPties><Cdtr><Nm>East Agile Limited</Nm></Cdtr></RltdPties>"
+			"</TxDtls></NtryDtls></Ntry></Stmt></BkToCstmrStmt></Document>"
+		)
+		row = parse_camt053(xml)[0]
+		self.assertEqual(row["reference"], "INV 3477")
+		parts = row["description"].split(" | ")
+		self.assertEqual(parts[0], "Sent money to EAST AGILE LIMITED")
+		self.assertIn("Development services", parts)
+		self.assertIn("East Agile Limited", parts)
