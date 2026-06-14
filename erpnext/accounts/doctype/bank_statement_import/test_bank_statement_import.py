@@ -324,3 +324,54 @@ class TestBankStatementImport(ERPNextTestSuite):
 		self.assertEqual(rows[0]["deposit"], 100.00)  # increase — NOT flipped
 		self.assertEqual(rows[0]["withdrawal"], "")
 		self.assertIn("Reversal", rows[0]["description"])
+
+	def test_parse_camt053_multiple_statements_and_currencies(self):
+		"""A document may carry several Stmt blocks (one per currency, as Wise
+		exports). Entries from every statement are returned, each with its own
+		currency taken from the Amt @Ccy attribute."""
+		xml = (
+			'<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10"><BkToCstmrStmt>'
+			"<Stmt><Acct><Ccy>GBP</Ccy></Acct><Ntry>"
+			'<Amt Ccy="GBP">10.00</Amt><CdtDbtInd>DBIT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>'
+			"<BookgDt><Dt>2026-03-01</Dt></BookgDt><AddtlNtryInf>GBP card</AddtlNtryInf></Ntry></Stmt>"
+			"<Stmt><Acct><Ccy>USD</Ccy></Acct><Ntry>"
+			'<Amt Ccy="USD">2003.40</Amt><CdtDbtInd>CRDT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>'
+			"<BookgDt><Dt>2026-04-08</Dt></BookgDt><AddtlNtryInf>Topped up account</AddtlNtryInf></Ntry></Stmt>"
+			"</BkToCstmrStmt></Document>"
+		)
+		rows = parse_camt053(xml)
+		self.assertEqual(len(rows), 2)
+		self.assertEqual(rows[0]["currency"], "GBP")
+		self.assertEqual(rows[0]["withdrawal"], 10.00)
+		self.assertEqual(rows[1]["currency"], "USD")
+		self.assertEqual(rows[1]["deposit"], 2003.40)
+
+	def test_parse_camt053_empty_statement(self):
+		"""A statement with no entries (e.g. an opened-but-unused currency) yields
+		no rows rather than erroring."""
+		xml = (
+			'<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10">'
+			"<BkToCstmrStmt><Stmt><Acct><Ccy>EUR</Ccy></Acct></Stmt></BkToCstmrStmt></Document>"
+		)
+		self.assertEqual(parse_camt053(xml), [])
+
+	def test_parse_camt053_description_assembly(self):
+		"""Description joins AddtlNtryInf + each RmtInf/Ustrd + counterparty,
+		de-duplicated and pipe-separated."""
+		xml = (
+			'<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.10">'
+			"<BkToCstmrStmt><Stmt><Ntry>"
+			'<Amt Ccy="USD">90.43</Amt><CdtDbtInd>DBIT</CdtDbtInd><Sts><Cd>BOOK</Cd></Sts>'
+			"<BookgDt><Dt>2026-03-03</Dt></BookgDt><AcctSvcrRef>INV 3477</AcctSvcrRef>"
+			"<AddtlNtryInf>Sent money to EAST AGILE LIMITED</AddtlNtryInf>"
+			"<NtryDtls><TxDtls>"
+			"<RmtInf><Ustrd>INV 3477</Ustrd><Ustrd>Development services</Ustrd></RmtInf>"
+			"<RltdPties><Cdtr><Nm>East Agile Limited</Nm></Cdtr></RltdPties>"
+			"</TxDtls></NtryDtls></Ntry></Stmt></BkToCstmrStmt></Document>"
+		)
+		row = parse_camt053(xml)[0]
+		self.assertEqual(row["reference"], "INV 3477")
+		parts = row["description"].split(" | ")
+		self.assertEqual(parts[0], "Sent money to EAST AGILE LIMITED")
+		self.assertIn("Development services", parts)
+		self.assertIn("East Agile Limited", parts)
