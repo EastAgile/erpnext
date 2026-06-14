@@ -323,10 +323,20 @@ def parse_camt053(content: str) -> list[dict]:
 			currency = amt_el.get("Ccy", "") if amt_el is not None else ""
 			cdtdbt = _text(ntry, "CdtDbtInd").upper()
 
+			# Per ISO 20022 (camt.053 MDR, ReversalIndicator), CdtDbtInd already
+			# states the actual direction of *this* booking; RvslInd only flags that
+			# the entry reverses an earlier one ("If the CreditDebitIndicator is CRDT
+			# and ReversalIndicator is Yes, the original operation was a debit entry").
+			# It therefore must NOT flip deposit/withdrawal — it is recorded
+			# informationally in the description only.
+			is_reversal = _text(ntry, "RvslInd").strip().lower() in ("true", "1", "yes")
+
 			date_str = _date(ntry, "BookgDt") or _date(ntry, "ValDt")
 			reference = _text(ntry, "AcctSvcrRef") or _text(ntry, "NtryRef")
 
 			description_parts = []
+			if is_reversal:
+				description_parts.append("[Reversal]")
 			addtl = _text(ntry, "AddtlNtryInf")
 			if addtl:
 				description_parts.append(addtl)
@@ -354,6 +364,13 @@ def parse_camt053(content: str) -> list[dict]:
 
 			if reference.upper() == "NOTPROVIDED":
 				reference = ""
+
+			# Fall back to the proprietary bank transaction code (e.g. Wise's
+			# CARD-xxx / TRANSFER-xxx ids) so card entries still get a stable,
+			# unique reference for reconciliation and idempotent re-imports.
+			if not reference:
+				prtry = _find(_find(ntry, "BkTxCd"), "Prtry")
+				reference = _text(prtry, "Cd")
 
 			# De-duplicate while preserving order, then join.
 			description = " | ".join(dict.fromkeys(p for p in description_parts if p))
